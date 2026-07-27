@@ -1,12 +1,15 @@
 use cosmwasm_std::{
     entry_point, to_json_binary, Binary, Deps, DepsMut, Env, MessageInfo, Response, StdError,
-    StdResult,
+    StdResult, Uint128,
 };
 
+use crate::collateral;
 use crate::error::ContractError;
 use crate::handshake::{self, ProtocolVersion};
-use crate::limits;
-use crate::msg::{ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg};
+use crate::msg::{
+    CollateralAllowlistResponse, CollateralBalanceResponse, CollateralEntryResponse,
+    ExecuteMsg, InstantiateMsg, MigrateMsg, QueryMsg,
+};
 use crate::oracles;
 use crate::penalties::LateFeeConfig;
 use crate::state::{
@@ -90,6 +93,27 @@ pub fn execute(
         ExecuteMsg::SetLateFeeConfig { config } => {
             execute_set_late_fee_config(deps, info, config)
         }
+        ExecuteMsg::DepositCollateral {
+            borrower,
+            denom,
+            amount,
+        } => execute_deposit_collateral(deps, info, borrower, denom, amount),
+        ExecuteMsg::WithdrawCollateral {
+            borrower,
+            denom,
+            amount,
+        } => execute_withdraw_collateral(deps, info, borrower, denom, amount),
+        ExecuteMsg::AddCollateralToken {
+            denom,
+            risk_weight_bps,
+        } => execute_add_collateral_token(deps, info, denom, risk_weight_bps),
+        ExecuteMsg::RemoveCollateralToken { denom } => {
+            execute_remove_collateral_token(deps, info, denom)
+        }
+        ExecuteMsg::SetCollateralRiskWeight {
+            denom,
+            risk_weight_bps,
+        } => execute_set_collateral_risk_weight(deps, info, denom, risk_weight_bps),
     }
 }
 
@@ -225,7 +249,7 @@ pub fn execute_repay_draw(
     }
 
     if !fee_amount.is_zero() {
-        fees::accrue_protocol_fee(deps.branch(), &draw.denom, fee_amount)?;
+        fees::accrue_protocol_fee(&mut deps.branch(), &draw.denom, fee_amount)?;
     }
 
     draw.repaid = true;
@@ -305,10 +329,6 @@ pub fn execute_update_protocol_version(
 }
 
 /// Configure the late-fee penalty model (admin only).
-///
-/// Sets the active [`LateFeeConfig`] — either a flat amount per missed
-/// installment or an APR-based surcharge applied during delinquency.
-/// Pass `None` to clear the config (disables late fees).
 pub fn execute_set_late_fee_config(
     deps: DepsMut,
     info: MessageInfo,
@@ -320,30 +340,17 @@ pub fn execute_set_late_fee_config(
     }
 
     if let Some(ref c) = config {
-        match c {
-            LateFeeConfig::Flat(flat) => {
-                if flat.amount < 0 {
-                    return Err(ContractError::LateFeeConfigInvalid);
-                }
-            }
-            LateFeeConfig::AprBased(apr) => {
-                if apr.surcharge_bps > 10_000 {
-                    return Err(ContractError::LateFeeConfigInvalid);
-                }
-            }
-        }
+        crate::penalties::validate_late_fee_config(c)?;
     }
 
-    let has_config = config.is_some();
-    if let Some(ref c) = config {
-        LATE_FEE_CONFIG.save(deps.storage, c)?;
-    } else {
-        LATE_FEE_CONFIG.remove(deps.storage);
+    match config {
+        Some(c) => LATE_FEE_CONFIG.save(deps.storage, &c)?,
+        None => LATE_FEE_CONFIG.remove(deps.storage),
     }
 
     Ok(Response::default()
         .add_attribute("action", "set_late_fee_config")
-        .add_attribute("has_config", has_config.to_string()))
+        .add_attribute("has_config", config.is_some().to_string()))
 }
 
 /// Configure the multi-oracle quorum parameters (admin only).
@@ -419,36 +426,120 @@ pub fn execute_submit_oracle_prices(
         .add_attribute("timestamp", now.to_string()))
 }
 
-/// Set or update the structured late-fee configuration (admin only).
+/// Deposit a collateral token on behalf of a borrower (admin only).
 ///
-/// Pass `Some(LateFeeConfig::Flat(…))` for a fixed token amount per missed
-/// installment, or `Some(LateFeeConfig::AprBased(…))` for an additive
-/// basis-point surcharge.  Pass `None` to remove the config.
+/// Records a `(borrower, denom)` entry in the multi-collateral store.
+/// The actual token transfer must be settled off-chain or by a separate
+/// settlement contract.
 ///
 /// # Errors
+///
 /// - [`ContractError::Unauthorized`] if the caller is not the contract owner.
-/// - [`ContractError::InvalidAmount`] if the flat amount is zero.
-/// - [`ContractError::RateTooHigh`] if the APR surcharge exceeds 10 000 bps.
-fn execute_set_late_fee_config(
+/// - [`ContractError::InvalidAmount`] if the amount is zero.
+/// - [`ContractError::CollateralTokenNotAllowed`] if `denom` is not in the
+///   allowlist.
+pub fn execute_deposit_collateral(
     deps: DepsMut,
     info: MessageInfo,
-    config: Option<crate::penalties::LateFeeConfig>,
+    borrower: String,
+    denom: String,
+    amount: String,
 ) -> Result<Response, ContractError> {
-    let contract_config = CONFIG.load(deps.storage)?;
-    if info.sender != contract_config.owner {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.owner {
         return Err(ContractError::Unauthorized);
     }
+    let borrower_addr = deps.api.addr_validate(&borrower)?;
+    let parsed_amount: Uint128 = amount.parse().map_err(|_| {
+        ContractError::Std(cosmwasm_std::StdError::parse_err("Uint128", &amount))
+    })?;
+    collateral::deposit_collateral(deps, &borrower_addr, &denom, parsed_amount)
+}
 
-    if let Some(ref cfg) = config {
-        crate::penalties::validate_late_fee_config(cfg)?;
+/// Withdraw a collateral token for a borrower (admin only).
+///
+/// # Errors
+///
+/// - [`ContractError::Unauthorized`] if the caller is not the contract owner.
+/// - [`ContractError::InvalidAmount`] if the amount is zero.
+/// - [`ContractError::InsufficientCollateralBalance`] if the balance is
+///   insufficient.
+pub fn execute_withdraw_collateral(
+    deps: DepsMut,
+    info: MessageInfo,
+    borrower: String,
+    denom: String,
+    amount: String,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.owner {
+        return Err(ContractError::Unauthorized);
     }
+    let borrower_addr = deps.api.addr_validate(&borrower)?;
+    let parsed_amount: Uint128 = amount.parse().map_err(|_| {
+        ContractError::Std(cosmwasm_std::StdError::parse_err("Uint128", &amount))
+    })?;
+    collateral::withdraw_collateral(deps, &borrower_addr, &denom, parsed_amount)
+}
 
-    match config {
-        Some(cfg) => LATE_FEE_CONFIG.save(deps.storage, &cfg)?,
-        None => LATE_FEE_CONFIG.remove(deps.storage),
+/// Add a denomination to the collateral allowlist (admin only).
+///
+/// # Errors
+///
+/// - [`ContractError::Unauthorized`] if the caller is not the contract owner.
+/// - [`ContractError::InvalidAmount`] if `risk_weight_bps > 10_000`.
+/// - [`ContractError::AlreadySettled`] if `denom` is already in the allowlist.
+pub fn execute_add_collateral_token(
+    deps: DepsMut,
+    info: MessageInfo,
+    denom: String,
+    risk_weight_bps: u32,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.owner {
+        return Err(ContractError::Unauthorized);
     }
+    collateral::add_collateral_token(deps, &denom, risk_weight_bps)
+}
 
-    Ok(Response::default().add_attribute("action", "set_late_fee_config"))
+/// Remove a denomination from the collateral allowlist (admin only).
+///
+/// # Errors
+///
+/// - [`ContractError::Unauthorized`] if the caller is not the contract owner.
+/// - [`ContractError::CollateralTokenNotAllowed`] if `denom` is not in the
+///   allowlist.
+pub fn execute_remove_collateral_token(
+    deps: DepsMut,
+    info: MessageInfo,
+    denom: String,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.owner {
+        return Err(ContractError::Unauthorized);
+    }
+    collateral::remove_collateral_token(deps, &denom)
+}
+
+/// Update the risk weight for an allowed collateral token (admin only).
+///
+/// # Errors
+///
+/// - [`ContractError::Unauthorized`] if the caller is not the contract owner.
+/// - [`ContractError::CollateralTokenNotAllowed`] if `denom` is not in the
+///   allowlist.
+/// - [`ContractError::InvalidAmount`] if `risk_weight_bps > 10_000`.
+pub fn execute_set_collateral_risk_weight(
+    deps: DepsMut,
+    info: MessageInfo,
+    denom: String,
+    risk_weight_bps: u32,
+) -> Result<Response, ContractError> {
+    let config = CONFIG.load(deps.storage)?;
+    if info.sender != config.owner {
+        return Err(ContractError::Unauthorized);
+    }
+    collateral::set_collateral_risk_weight(deps, &denom, risk_weight_bps)
 }
 
 fn append_audit_entry(
@@ -526,7 +617,61 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
             let resp = crate::msg::LateFeeConfigResponse { config };
             to_json_binary(&resp)
         }
+        QueryMsg::GetCollateralBalance { borrower, denom } => {
+            query_collateral_balance(deps, borrower, denom)
+        }
+        QueryMsg::GetCollateralAllowlist {} => query_collateral_allowlist(deps),
     }
+}
+
+fn query_collateral_balance(
+    deps: Deps,
+    borrower: String,
+    denom: Option<String>,
+) -> StdResult<Binary> {
+    let borrower_addr = deps.api.addr_validate(&borrower)?;
+
+    let entries = match denom {
+        Some(ref d) => {
+            let amount = collateral::query_collateral_balance(deps, &borrower_addr, d);
+            let risk_weight_bps = collateral::collateral_risk_weight_bps(deps, d);
+            if amount.is_zero() {
+                vec![]
+            } else {
+                vec![CollateralEntryResponse {
+                    denom: d.clone(),
+                    amount,
+                    risk_weight_bps,
+                }]
+            }
+        }
+        None => {
+            let raw = collateral::query_borrower_collateral(deps, &borrower_addr);
+            raw.into_iter()
+                .map(|(denom, amount)| CollateralEntryResponse {
+                    denom: denom.clone(),
+                    amount,
+                    risk_weight_bps: collateral::collateral_risk_weight_bps(deps, &denom),
+                })
+                .collect()
+        }
+    };
+
+    let weighted_total = collateral::weighted_collateral_total(deps, &borrower_addr)
+        .map_err(|e| StdError::generic_err(e.to_string()))?;
+
+    let resp = CollateralBalanceResponse {
+        borrower,
+        entries,
+        weighted_total,
+    };
+    to_json_binary(&resp)
+}
+
+fn query_collateral_allowlist(deps: Deps) -> StdResult<Binary> {
+    let denoms = collateral::query_collateral_allowlist(deps);
+    let resp = CollateralAllowlistResponse { denoms };
+    to_json_binary(&resp)
 }
 
 #[entry_point]
@@ -590,7 +735,7 @@ mod tests {
             setup(&mut deps);
             let admin = creator(&deps);
 
-            let config = LateFeeConfig::Flat(FlatFeeConfig { amount: 100 });
+            let config = LateFeeConfig::Flat(FlatFeeConfig { amount: Uint128::new(100) });
             set_late_fee_config(&mut deps, &admin, Some(config.clone())).unwrap();
 
             let stored = query_late_fee_config(&deps);
@@ -616,7 +761,7 @@ mod tests {
             setup(&mut deps);
             let admin = creator(&deps);
 
-            let config = LateFeeConfig::Flat(FlatFeeConfig { amount: 50 });
+            let config = LateFeeConfig::Flat(FlatFeeConfig { amount: Uint128::new(50) });
             set_late_fee_config(&mut deps, &admin, Some(config)).unwrap();
             assert!(query_late_fee_config(&deps).is_some());
 
@@ -630,20 +775,20 @@ mod tests {
             setup(&mut deps);
             let unauth = non_admin(&deps);
 
-            let config = LateFeeConfig::Flat(FlatFeeConfig { amount: 100 });
+            let config = LateFeeConfig::Flat(FlatFeeConfig { amount: Uint128::new(100) });
             let err = set_late_fee_config(&mut deps, &unauth, Some(config)).unwrap_err();
             assert_eq!(err, ContractError::Unauthorized);
         }
 
         #[test]
-        fn negative_flat_amount_rejected() {
+        fn zero_flat_amount_rejected() {
             let mut deps = mock_dependencies();
             setup(&mut deps);
             let admin = creator(&deps);
 
-            let config = LateFeeConfig::Flat(FlatFeeConfig { amount: -1 });
+            let config = LateFeeConfig::Flat(FlatFeeConfig { amount: Uint128::new(0) });
             let err = set_late_fee_config(&mut deps, &admin, Some(config)).unwrap_err();
-            assert_eq!(err, ContractError::LateFeeConfigInvalid);
+            assert_eq!(err, ContractError::InvalidAmount);
         }
 
         #[test]
@@ -654,7 +799,7 @@ mod tests {
 
             let config = LateFeeConfig::AprBased(AprFeeConfig { surcharge_bps: 10_001 });
             let err = set_late_fee_config(&mut deps, &admin, Some(config)).unwrap_err();
-            assert_eq!(err, ContractError::LateFeeConfigInvalid);
+            assert_eq!(err, ContractError::RateTooHigh);
         }
 
         #[test]
@@ -687,7 +832,7 @@ mod tests {
             setup(&mut deps);
             let admin = creator(&deps);
 
-            let config = LateFeeConfig::Flat(FlatFeeConfig { amount: 200 });
+            let config = LateFeeConfig::Flat(FlatFeeConfig { amount: Uint128::new(200) });
             let resp = set_late_fee_config(&mut deps, &admin, Some(config)).unwrap();
             assert_eq!(resp.attributes[0].key, "action");
             assert_eq!(resp.attributes[0].value, "set_late_fee_config");
@@ -712,7 +857,7 @@ mod tests {
             setup(&mut deps);
             let admin = creator(&deps);
 
-            let flat = LateFeeConfig::Flat(FlatFeeConfig { amount: 100 });
+            let flat = LateFeeConfig::Flat(FlatFeeConfig { amount: Uint128::new(100) });
             let apr = LateFeeConfig::AprBased(AprFeeConfig { surcharge_bps: 200 });
 
             set_late_fee_config(&mut deps, &admin, Some(flat)).unwrap();
@@ -722,17 +867,552 @@ mod tests {
             assert_eq!(stored, Some(apr));
         }
 
+    }
+
+    mod collateral {
+        use super::*;
+
+        fn admin(deps: &OwnedDeps<MockStorage, MockApi, MockQuerier>) -> Addr {
+            creator(deps)
+        }
+
+        fn borrower(deps: &OwnedDeps<MockStorage, MockApi, MockQuerier>) -> Addr {
+            deps.api.addr_make("borrower")
+        }
+
+        fn deposit_collateral(
+            deps: &mut OwnedDeps<MockStorage, MockApi, MockQuerier>,
+            sender: &Addr,
+            borrower: &str,
+            denom: &str,
+            amount: &str,
+        ) -> Result<Response, ContractError> {
+            let env = mock_env();
+            let info = message_info(sender, &[]);
+            let msg = ExecuteMsg::DepositCollateral {
+                borrower: borrower.to_string(),
+                denom: denom.to_string(),
+                amount: amount.to_string(),
+            };
+            execute(deps.as_mut(), env, info, msg)
+        }
+
+        fn withdraw_collateral(
+            deps: &mut OwnedDeps<MockStorage, MockApi, MockQuerier>,
+            sender: &Addr,
+            borrower: &str,
+            denom: &str,
+            amount: &str,
+        ) -> Result<Response, ContractError> {
+            let env = mock_env();
+            let info = message_info(sender, &[]);
+            let msg = ExecuteMsg::WithdrawCollateral {
+                borrower: borrower.to_string(),
+                denom: denom.to_string(),
+                amount: amount.to_string(),
+            };
+            execute(deps.as_mut(), env, info, msg)
+        }
+
+        fn add_collateral_token(
+            deps: &mut OwnedDeps<MockStorage, MockApi, MockQuerier>,
+            sender: &Addr,
+            denom: &str,
+            risk_weight_bps: u32,
+        ) -> Result<Response, ContractError> {
+            let env = mock_env();
+            let info = message_info(sender, &[]);
+            let msg = ExecuteMsg::AddCollateralToken {
+                denom: denom.to_string(),
+                risk_weight_bps,
+            };
+            execute(deps.as_mut(), env, info, msg)
+        }
+
+        fn remove_collateral_token(
+            deps: &mut OwnedDeps<MockStorage, MockApi, MockQuerier>,
+            sender: &Addr,
+            denom: &str,
+        ) -> Result<Response, ContractError> {
+            let env = mock_env();
+            let info = message_info(sender, &[]);
+            let msg = ExecuteMsg::RemoveCollateralToken {
+                denom: denom.to_string(),
+            };
+            execute(deps.as_mut(), env, info, msg)
+        }
+
+        fn set_collateral_risk_weight(
+            deps: &mut OwnedDeps<MockStorage, MockApi, MockQuerier>,
+            sender: &Addr,
+            denom: &str,
+            risk_weight_bps: u32,
+        ) -> Result<Response, ContractError> {
+            let env = mock_env();
+            let info = message_info(sender, &[]);
+            let msg = ExecuteMsg::SetCollateralRiskWeight {
+                denom: denom.to_string(),
+                risk_weight_bps,
+            };
+            execute(deps.as_mut(), env, info, msg)
+        }
+
+        fn query_collateral_balance(
+            deps: &OwnedDeps<MockStorage, MockApi, MockQuerier>,
+            borrower: &str,
+            denom: Option<&str>,
+        ) -> crate::msg::CollateralBalanceResponse {
+            let env = mock_env();
+            let msg = QueryMsg::GetCollateralBalance {
+                borrower: borrower.to_string(),
+                denom: denom.map(|d| d.to_string()),
+            };
+            let raw = query(deps.as_ref(), env, msg).unwrap();
+            from_json(&raw).unwrap()
+        }
+
+        fn query_collateral_allowlist(
+            deps: &OwnedDeps<MockStorage, MockApi, MockQuerier>,
+        ) -> crate::msg::CollateralAllowlistResponse {
+            let env = mock_env();
+            let msg = QueryMsg::GetCollateralAllowlist {};
+            let raw = query(deps.as_ref(), env, msg).unwrap();
+            from_json(&raw).unwrap()
+        }
+
+        fn query_health(
+            deps: &OwnedDeps<MockStorage, MockApi, MockQuerier>,
+            borrower: &str,
+        ) -> crate::msg::BorrowerHealthFactorResponse {
+            let env = mock_env();
+            let msg = QueryMsg::BorrowerHealthFactor {
+                borrower: borrower.to_string(),
+            };
+            let raw = query(deps.as_ref(), env, msg).unwrap();
+            from_json(&raw).unwrap()
+        }
+
+        fn query_por(
+            deps: &OwnedDeps<MockStorage, MockApi, MockQuerier>,
+            denom: Option<String>,
+        ) -> crate::msg::ProofOfReserveResponse {
+            let env = mock_env();
+            let msg = QueryMsg::ProofOfReserve { denom };
+            let raw = query(deps.as_ref(), env, msg).unwrap();
+            from_json(&raw).unwrap()
+        }
+
+        fn create_credit_line(
+            deps: &mut OwnedDeps<MockStorage, MockApi, MockQuerier>,
+            sender: &Addr,
+            borrower: &str,
+            coll_denom: &str,
+            coll_amount: &str,
+            credit_denom: &str,
+            credit_amount: &str,
+        ) -> Result<Response, ContractError> {
+            let env = mock_env();
+            let info = message_info(sender, &[]);
+            let msg = ExecuteMsg::CreateCreditLine {
+                borrower: borrower.to_string(),
+                collateral_denom: coll_denom.to_string(),
+                collateral_amount: coll_amount.to_string(),
+                credit_denom: credit_denom.to_string(),
+                credit_amount: credit_amount.to_string(),
+            };
+            execute(deps.as_mut(), env, info, msg)
+        }
+
+        fn create_draw(
+            deps: &mut OwnedDeps<MockStorage, MockApi, MockQuerier>,
+            borrower: &Addr,
+            credit_line_id: u64,
+            amount: &str,
+        ) -> Result<Response, ContractError> {
+            let env = mock_env();
+            let info = message_info(borrower, &[]);
+            let msg = ExecuteMsg::CreateDraw {
+                credit_line_id,
+                amount: amount.to_string(),
+                denom: "ucredit".to_string(),
+            };
+            execute(deps.as_mut(), env, info, msg)
+        }
+
+        // ── Deposit / Withdraw authorisation ──────────────────────────
+
         #[test]
-        fn zero_flat_amount_accepted() {
+        fn deposit_collateral_requires_admin() {
             let mut deps = mock_dependencies();
             setup(&mut deps);
-            let admin = creator(&deps);
+            let unauth = non_admin(&deps);
+            let err = deposit_collateral(&mut deps, &unauth, "borrower", "uusd", "100")
+                .unwrap_err();
+            assert_eq!(err, ContractError::Unauthorized);
+        }
 
-            let config = LateFeeConfig::Flat(FlatFeeConfig { amount: 0 });
-            set_late_fee_config(&mut deps, &admin, Some(config.clone())).unwrap();
+        #[test]
+        fn withdraw_collateral_requires_admin() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let unauth = non_admin(&deps);
+            let err = withdraw_collateral(&mut deps, &unauth, "borrower", "uusd", "100")
+                .unwrap_err();
+            assert_eq!(err, ContractError::Unauthorized);
+        }
 
-            let stored = query_late_fee_config(&deps);
-            assert_eq!(stored, Some(config));
+        // ── Add / Remove / Set risk-weight authorisation ───────────────
+
+        #[test]
+        fn add_collateral_token_requires_admin() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let unauth = non_admin(&deps);
+            let err = add_collateral_token(&mut deps, &unauth, "uusd", 10_000).unwrap_err();
+            assert_eq!(err, ContractError::Unauthorized);
+        }
+
+        #[test]
+        fn remove_collateral_token_requires_admin() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let unauth = non_admin(&deps);
+            let err = remove_collateral_token(&mut deps, &unauth, "uusd").unwrap_err();
+            assert_eq!(err, ContractError::Unauthorized);
+        }
+
+        #[test]
+        fn set_collateral_risk_weight_requires_admin() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let unauth = non_admin(&deps);
+            let err =
+                set_collateral_risk_weight(&mut deps, &unauth, "uusd", 5_000).unwrap_err();
+            assert_eq!(err, ContractError::Unauthorized);
+        }
+
+        // ── Deposit / Withdraw success paths ──────────────────────────
+
+        #[test]
+        fn deposit_and_query_balance() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let borrower_addr = borrower(&deps);
+            let borrower_str = borrower_addr.to_string();
+
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+
+            deposit_collateral(&mut deps, &admin, &borrower_str, "uusd", "500").unwrap();
+
+            let resp = query_collateral_balance(&deps, &borrower_str, Some("uusd"));
+            assert_eq!(resp.borrower, borrower_str);
+            assert_eq!(resp.entries.len(), 1);
+            assert_eq!(resp.entries[0].denom, "uusd");
+            assert_eq!(resp.entries[0].amount, Uint128::new(500));
+            assert_eq!(resp.entries[0].risk_weight_bps, 10_000);
+            assert_eq!(resp.weighted_total, Uint128::new(500));
+        }
+
+        #[test]
+        fn deposit_multiple_tokens_and_query_all() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let borrower_str = borrower(&deps).to_string();
+
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+            add_collateral_token(&mut deps, &admin, "uatom", 5_000).unwrap();
+
+            deposit_collateral(&mut deps, &admin, &borrower_str, "uusd", "1000").unwrap();
+            deposit_collateral(&mut deps, &admin, &borrower_str, "uatom", "200").unwrap();
+
+            let resp = query_collateral_balance(&deps, &borrower_str, None);
+            assert_eq!(resp.entries.len(), 2);
+            // weighted: 1000*10000/10000 + 200*5000/10000 = 1000 + 100 = 1100
+            assert_eq!(resp.weighted_total, Uint128::new(1100));
+        }
+
+        #[test]
+        fn withdraw_after_deposit() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let borrower_str = borrower(&deps).to_string();
+
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+            deposit_collateral(&mut deps, &admin, &borrower_str, "uusd", "500").unwrap();
+            withdraw_collateral(&mut deps, &admin, &borrower_str, "uusd", "200").unwrap();
+
+            let resp = query_collateral_balance(&deps, &borrower_str, Some("uusd"));
+            assert_eq!(resp.entries[0].amount, Uint128::new(300));
+        }
+
+        #[test]
+        fn insufficient_balance_on_withdraw() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let borrower_str = borrower(&deps).to_string();
+
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+            deposit_collateral(&mut deps, &admin, &borrower_str, "uusd", "100").unwrap();
+
+            let err =
+                withdraw_collateral(&mut deps, &admin, &borrower_str, "uusd", "200").unwrap_err();
+            assert_eq!(err, ContractError::InsufficientCollateralBalance);
+        }
+
+        #[test]
+        fn invalid_amount_on_zero_deposit() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let borrower_str = borrower(&deps).to_string();
+
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+            let err =
+                deposit_collateral(&mut deps, &admin, &borrower_str, "uusd", "0").unwrap_err();
+            assert_eq!(err, ContractError::InvalidAmount);
+        }
+
+        // ── Allowlist management ──────────────────────────────────────
+
+        #[test]
+        fn add_and_remove_token() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+
+            let list = query_collateral_allowlist(&deps);
+            assert!(list.denoms.contains(&"uusd".to_string()));
+
+            remove_collateral_token(&mut deps, &admin, "uusd").unwrap();
+
+            let list2 = query_collateral_allowlist(&deps);
+            assert!(!list2.denoms.contains(&"uusd".to_string()));
+        }
+
+        #[test]
+        fn deposit_rejected_for_unlisted_token() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let borrower_str = borrower(&deps).to_string();
+
+            let err =
+                deposit_collateral(&mut deps, &admin, &borrower_str, "uusd", "100").unwrap_err();
+            assert_eq!(err, ContractError::CollateralTokenNotAllowed);
+        }
+
+        // ── Multi-collateral health factor ────────────────────────────
+
+        #[test]
+        fn health_factor_includes_multi_collateral() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let borrower_addr = borrower(&deps);
+            let borrower_str = borrower_addr.to_string();
+
+            // Create a credit line: collateral 1000, credit 500
+            create_credit_line(
+                &mut deps,
+                &admin,
+                &borrower_str,
+                "ucollateral",
+                "1000",
+                "ucredit",
+                "500",
+            )
+            .unwrap();
+
+            // Draw 100
+            create_draw(&mut deps, &borrower_addr, 0, "100").unwrap();
+
+            // Add multi-collateral: 200 of uatom at 50% risk weight
+            add_collateral_token(&mut deps, &admin, "uatom", 5_000).unwrap();
+            deposit_collateral(&mut deps, &admin, &borrower_str, "uatom", "200").unwrap();
+
+            let resp = query_health(&deps, &borrower_str);
+            assert_eq!(resp.credit_lines.len(), 1);
+
+            // effective_collateral = 1000 (credit line) + 200*5000/10000 (multi) = 1000 + 100 = 1100
+            // health = 1100 * 10_000 / 100 = 110_000
+            assert_eq!(resp.credit_lines[0].health_factor_bps, 110_000);
+        }
+
+        #[test]
+        fn health_factor_with_only_multi_collateral() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let borrower_addr = borrower(&deps);
+            let borrower_str = borrower_addr.to_string();
+
+            // Create a credit line with zero collateral
+            create_credit_line(
+                &mut deps,
+                &admin,
+                &borrower_str,
+                "ucollateral",
+                "0",
+                "ucredit",
+                "500",
+            )
+            .unwrap();
+
+            // Draw 100
+            create_draw(&mut deps, &borrower_addr, 0, "100").unwrap();
+
+            // Without any multi-collateral, effective_collateral = 0 → health = 0
+            let resp1 = query_health(&deps, &borrower_str);
+            assert_eq!(resp1.credit_lines[0].health_factor_bps, 0);
+
+            // Add multi-collateral: 500 uusd at 100% weight
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+            deposit_collateral(&mut deps, &admin, &borrower_str, "uusd", "500").unwrap();
+
+            let resp2 = query_health(&deps, &borrower_str);
+            // effective_collateral = 0 + 500 = 500
+            // health = 500 * 10_000 / 100 = 50_000
+            assert_eq!(resp2.credit_lines[0].health_factor_bps, 50_000);
+        }
+
+        // ── Multi-collateral proof of reserve ─────────────────────────
+
+        #[test]
+        fn proof_of_reserve_includes_multi_collateral() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let borrower_addr = borrower(&deps);
+            let borrower_str = borrower_addr.to_string();
+
+            create_credit_line(
+                &mut deps,
+                &admin,
+                &borrower_str,
+                "ucollateral",
+                "1000",
+                "ucredit",
+                "500",
+            )
+            .unwrap();
+
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+            deposit_collateral(&mut deps, &admin, &borrower_str, "uusd", "200").unwrap();
+
+            let por = query_por(&deps, None);
+            // total_collateral should include both: 1000 + 200 = 1200
+            assert_eq!(por.total_collateral, Uint128::new(1200));
+
+            // Filter by multi-collateral denom
+            let por_uusd = query_por(&deps, Some("uusd".to_string()));
+            assert_eq!(por_uusd.reserves_by_denom.len(), 1);
+            assert_eq!(por_uusd.reserves_by_denom[0].denom, "uusd");
+            assert_eq!(
+                por_uusd.reserves_by_denom[0].collateral_amount,
+                Uint128::new(200)
+            );
+            assert_eq!(por_uusd.total_collateral, Uint128::new(200));
+        }
+
+        // ── Edge cases ────────────────────────────────────────────────
+
+        #[test]
+        fn deposit_zero_amount_rejected() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let borrower_str = borrower(&deps).to_string();
+
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+            let err =
+                deposit_collateral(&mut deps, &admin, &borrower_str, "uusd", "0").unwrap_err();
+            assert_eq!(err, ContractError::InvalidAmount);
+        }
+
+        #[test]
+        fn withdraw_zero_amount_rejected() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let borrower_str = borrower(&deps).to_string();
+
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+            deposit_collateral(&mut deps, &admin, &borrower_str, "uusd", "100").unwrap();
+            let err =
+                withdraw_collateral(&mut deps, &admin, &borrower_str, "uusd", "0").unwrap_err();
+            assert_eq!(err, ContractError::InvalidAmount);
+        }
+
+        #[test]
+        fn add_existing_token_rejected() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+            let err = add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap_err();
+            assert_eq!(err, ContractError::AlreadySettled);
+        }
+
+        #[test]
+        fn remove_unlisted_token_rejected() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+
+            let err = remove_collateral_token(&mut deps, &admin, "uusd").unwrap_err();
+            assert_eq!(err, ContractError::CollateralTokenNotAllowed);
+        }
+
+        #[test]
+        fn risk_weight_exceeds_max_rejected() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+
+            let err = add_collateral_token(&mut deps, &admin, "uusd", 10_001).unwrap_err();
+            assert_eq!(err, ContractError::InvalidAmount);
+        }
+
+        #[test]
+        fn borrower_collateral_independent_from_credit_line() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let borrower_str = borrower(&deps).to_string();
+
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+            deposit_collateral(&mut deps, &admin, &borrower_str, "uusd", "300").unwrap();
+
+            // No credit lines exist, but collateral should still be queryable
+            let resp = query_collateral_balance(&deps, &borrower_str, Some("uusd"));
+            assert_eq!(resp.entries.len(), 1);
+            assert_eq!(resp.entries[0].amount, Uint128::new(300));
+        }
+
+        #[test]
+        fn multiple_borrowers_independent_collateral() {
+            let mut deps = mock_dependencies();
+            setup(&mut deps);
+            let admin = admin(&deps);
+            let b1 = deps.api.addr_make("borrower1").to_string();
+            let b2 = deps.api.addr_make("borrower2").to_string();
+
+            add_collateral_token(&mut deps, &admin, "uusd", 10_000).unwrap();
+            deposit_collateral(&mut deps, &admin, &b1, "uusd", "500").unwrap();
+            deposit_collateral(&mut deps, &admin, &b2, "uusd", "300").unwrap();
+
+            let r1 = query_collateral_balance(&deps, &b1, Some("uusd"));
+            assert_eq!(r1.entries[0].amount, Uint128::new(500));
+
+            let r2 = query_collateral_balance(&deps, &b2, Some("uusd"));
+            assert_eq!(r2.entries[0].amount, Uint128::new(300));
         }
     }
 }
